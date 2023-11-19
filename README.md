@@ -1,1 +1,1 @@
-# jobs_queue
+# jobs-queue
