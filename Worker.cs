@@ -1,26 +1,22 @@
+using JobsQueue.Jobs;
 using System.Collections.Concurrent;
 using System.Diagnostics.CodeAnalysis;
 using System.Security.Cryptography;
+using System.Text;
 
 namespace JobsQueue
 {
     public class Worker : BackgroundService
     {
-        private readonly int MAX_THREADS = 60;
-        private readonly int MIN_THREADS = 10;
+        private readonly int MAX_THREADS = 5;
+        private readonly int MIN_THREADS = 2;
+        private Task[] _tasks;
         private static EventWaitHandle eventWaitHandle = new EventWaitHandle(false, EventResetMode.ManualReset);
         private readonly ConcurrentQueue<Job> _jobsQueueHighestPriority = new ConcurrentQueue<Job>();
         private readonly ConcurrentQueue<Job> _jobsQueueAboveNormalPriority = new ConcurrentQueue<Job>();
         private readonly ConcurrentQueue<Job> _jobsQueueNormalPriority = new ConcurrentQueue<Job>();
         private readonly ConcurrentQueue<Job> _jobsQueueLowestPriority = new ConcurrentQueue<Job>();
         private readonly ConcurrentQueue<Job> _jobsQueueBelowNormalPriority = new ConcurrentQueue<Job>();
-        private bool _jobQueuesAreEmpty => (
-            _jobsQueueHighestPriority.IsEmpty &&
-            _jobsQueueAboveNormalPriority.IsEmpty &&
-            _jobsQueueNormalPriority.IsEmpty &&
-            _jobsQueueLowestPriority.IsEmpty &&
-            _jobsQueueBelowNormalPriority.IsEmpty
-        );
         private int _jobsEnqueuedCount => (
             _jobsQueueHighestPriority.Count +
             _jobsQueueAboveNormalPriority.Count +
@@ -28,14 +24,17 @@ namespace JobsQueue
             _jobsQueueLowestPriority.Count +
             _jobsQueueBelowNormalPriority.Count
         );
-        private Task[] _tasks;
-        private List<Job> _totalJobs = new List<Job>();
+        private List<Job> _jobs = new List<Job>();
+        private readonly JobRepository _jobRepository;
+        private readonly IConfiguration _configuration;
         private readonly ILogger<Worker> _logger;
 
-        public Worker(ILogger<Worker> logger)
+        public Worker(IConfiguration configuration, ILogger<Worker> logger)
         {
-            _tasks = new Task[MAX_THREADS];
+            _configuration = configuration;
+            _jobRepository = new JobRepository(_configuration);
             _logger = logger;
+            _tasks = new Task[MAX_THREADS];
         }
 
         /// <summary>
@@ -50,18 +49,20 @@ namespace JobsQueue
                 if (_logger.IsEnabled(LogLevel.Information))
                     _logger.LogInformation("Worker started at: {time}", DateTimeOffset.Now);
 
-                var delay = TimeSpan.FromSeconds(0);
+                var delay = TimeSpan.FromSeconds(4);
 
                 while (!stoppingToken.IsCancellationRequested)
                 {
                     _logger.LogInformation("\n\nWorker iteration started with {0} jobs enqueued\n\n", _jobsEnqueuedCount);
+                    _jobs = _jobs.AsParallel().Where(job => !new[] { JobStatus.Finished, JobStatus.Failed }.Contains(job.Status)).ToList();
 
-                    var jobs = await FetchJobs(stoppingToken);
+                    var jobs = await _jobRepository.JobsGetAsync();
 
                     if (jobs.Any())
                     {
-                        delay = TimeSpan.FromSeconds(10);
-                        EnqueueJobs(jobs);
+                        //delay = TimeSpan.FromSeconds(10);
+                        await EnqueueJobs(jobs);
+                        _jobs.AddRange(jobs);
                         // Avisar a los hilos que están esperando para que revisen las colas
                         eventWaitHandle.Set();
                     }
@@ -71,42 +72,36 @@ namespace JobsQueue
                     _logger.LogInformation("\n\nWorker iteration finished with {0} jobs enqueued\n\n", _jobsEnqueuedCount);
 
                     await Task.Delay(delay, stoppingToken);
-                    delay = delay.Add(TimeSpan.FromSeconds(10));
+                    //delay = delay.Add(TimeSpan.FromSeconds(10));
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                if (_logger.IsEnabled(LogLevel.Information) && stoppingToken.IsCancellationRequested)
+                _jobs = _jobs.AsParallel().Where(job => !new[] { JobStatus.Finished, JobStatus.Failed }.Contains(job.Status)).ToList();
+
+                if (!stoppingToken.IsCancellationRequested)
+                {
+                    await JobsUpdateAsFailed(ex, _jobs.ToArray());
+                    throw;
+                }
+
+                if (_logger.IsEnabled(LogLevel.Information))
                     _logger.LogInformation("Worker has stoped at: {time}", DateTimeOffset.Now);
+
+                await _jobRepository.JobsUpdateStatusAsync(_jobs.Select(i => i.Id).ToArray(), JobStatus.Pending);
             }
         }
 
-        protected async Task<List<Job>> FetchJobs(CancellationToken stoppingToken)
-        {
-            _logger.LogInformation("Fetching jobs...");
-
-            var jobs = new List<Job>();
-            var count = RandomNumberGenerator.GetInt32(10) + 1;
-
-            while(--count > 0) {
-                jobs.Add(new Job {
-                    Id = uint.Parse((_totalJobs.Count + count).ToString()),
-                    Kind = (JobKind) RandomNumberGenerator.GetInt32((int) JobKind.AccountingBill, (int) JobKind.AccountingInvoice + 1),
-                    Priority = (JobPriority) RandomNumberGenerator.GetInt32((int) JobPriority.Lowest, (int) JobPriority.Highest + 1)
-                });
-            }
-
-            await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken);
-
-            _logger.LogInformation("Fetched jobs {0}", jobs.Count);
-
-            return jobs;
-        }
-
-        protected void EnqueueJobs(List<Job> jobs)
+        private async Task EnqueueJobs(List<Job> jobs)
         {
             _logger.LogInformation("Enqueueing {0} jobs...", jobs.Count);
-            _totalJobs.AddRange(jobs);
+
+            await _jobRepository.JobsUpdateStatusAsync(jobs.Select(i => i.Id).ToArray(), JobStatus.Enqueued);
+
+            jobs.ForEach(job =>
+            {
+                job.Status = JobStatus.Enqueued;
+            });
 
             foreach (var job in jobs)
             {
@@ -133,7 +128,7 @@ namespace JobsQueue
             _logger.LogInformation("Enqueueed {0} jobs", jobs.Count);
         }
 
-        protected bool TryDequeueJob([MaybeNullWhen(false)] out Job job)
+        private bool TryDequeueJob([MaybeNullWhen(false)] out Job job)
         {
             if (_jobsQueueHighestPriority.TryDequeue(out job))
                 return true;
@@ -149,14 +144,27 @@ namespace JobsQueue
             return false;
         }
 
-        protected async Task SpawnTask(int index, CancellationToken stoppingToken)
+        private Task SpawnTask(int index, CancellationToken stoppingToken) => Task.Run(async () =>
         {
             _logger.LogInformation("Task {index} spawned", index);
 
             while (!stoppingToken.IsCancellationRequested)
             {
                 while ((MIN_THREADS > index || _jobsEnqueuedCount > 0) && TryDequeueJob(out var job))
-                    await DoWork(job, index, stoppingToken);
+                {
+                    try
+                    {
+                        job.Status = JobStatus.Running;
+                        await _jobRepository.JobsUpdateStatusAsync([job.Id], JobStatus.Running);
+                        await DoWork(job, index, stoppingToken);
+                        await _jobRepository.JobsUpdateStatusAsync([job.Id], JobStatus.Finished);
+                        job.Status = JobStatus.Finished;
+                    }
+                    catch (Exception ex)
+                    {
+                        await JobsUpdateAsFailed(ex, job);
+                    }
+                }
 
                 if (index > MIN_THREADS - 1)
                     break;
@@ -166,9 +174,9 @@ namespace JobsQueue
             }
 
             _logger.LogInformation("Task {index} dead", index);
-        }
+        }, stoppingToken);
 
-        protected void SpawnTasks(CancellationToken stoppingToken)
+        private void SpawnTasks(CancellationToken stoppingToken)
         {
             if (_jobsEnqueuedCount == 0)
                 return;
@@ -176,11 +184,12 @@ namespace JobsQueue
             var neededThreads = int.Min(_jobsEnqueuedCount, MAX_THREADS);
             var offset = 0;
 
-            for (int index = 0; index < neededThreads + offset; index++)
+            for (int index = 0; index < int.Min(neededThreads + offset, MAX_THREADS - 1); index++)
             {
+                _logger.LogInformation("Thread at {index} is {status}", index, _tasks[index]?.Status.ToString() ?? "Empty");
+
                 if (_tasks[index] != null && !_tasks[index].IsCompleted)
                 {
-                    _logger.LogInformation("Thread at {index} is {status}", index, _tasks[index].Status);
                     offset = int.Min(offset + 1, MAX_THREADS);
                     continue;
                 }
@@ -188,14 +197,31 @@ namespace JobsQueue
                 if (_tasks[index] != null && _tasks[index].IsCompleted)
                     _tasks[index].Dispose();
 
-                if (_jobsEnqueuedCount == 0)
-                    break;
-
+                _logger.LogInformation("Thread at {index} new assigned", index);
                 _tasks[index] = SpawnTask(index, stoppingToken);
             }
         }
 
-        protected async Task DoWork(Job job, int index, CancellationToken stoppingToken)
+        private async Task JobsUpdateAsFailed(Exception ex, params Job[] jobs)
+        {
+
+            var message = new StringBuilder(ex.ToString());
+
+            if (ex.InnerException != null)
+                message.AppendLine("|").Append(ex.InnerException);
+
+            message.AppendLine("|").Append(ex.StackTrace);
+
+            foreach (var job in jobs)
+            {
+                job.Status = JobStatus.Failed;
+                job.Message = message.ToString();
+            }
+
+            await _jobRepository.JobsUpdateStatusAsync(jobs.Select(i => i.Id).ToArray(), JobStatus.Failed, message.ToString());
+        }
+
+        private async Task DoWork(Job job, int index, CancellationToken stoppingToken)
         {
             var delay = TimeSpan.FromSeconds(RandomNumberGenerator.GetInt32(60 * 2));
 
@@ -203,27 +229,5 @@ namespace JobsQueue
             await Task.Delay(delay, stoppingToken);
             _logger.LogInformation($"[{DateTimeOffset.Now}] thread {index} finished Job <Id: {job.Id}, Kind: {job.Kind}, Priority: {job.Priority}>, took {delay.TotalSeconds} seconds");
         }
-    }
-
-    public enum JobKind
-    {
-        AccountingBill,
-        AccountingInvoice,
-    }
-    
-    public enum JobPriority
-    {
-        Lowest,
-        BelowNormal,
-        Normal,
-        AboveNormal,
-        Highest,
-    }
-
-    public sealed class Job
-    {
-        public uint Id { get; set; }
-        public JobKind Kind { get; set; }
-        public JobPriority Priority { get; set; }
     }
 }
