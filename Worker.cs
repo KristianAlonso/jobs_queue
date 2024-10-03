@@ -50,6 +50,7 @@ namespace JobsQueue
                     _logger.LogInformation("Worker started at: {time}", DateTimeOffset.Now);
 
                 var delay = TimeSpan.FromSeconds(4);
+                var maxDelay = TimeSpan.FromMinutes(1);
 
                 while (!stoppingToken.IsCancellationRequested)
                 {
@@ -60,7 +61,7 @@ namespace JobsQueue
 
                     if (jobs.Any())
                     {
-                        //delay = TimeSpan.FromSeconds(10);
+                        delay = TimeSpan.FromSeconds(10);
                         await EnqueueJobs(jobs);
                         _jobs.AddRange(jobs);
                         // Avisar a los hilos que están esperando para que revisen las colas
@@ -72,8 +73,14 @@ namespace JobsQueue
                     _logger.LogInformation("\n\nWorker iteration finished with {0} jobs enqueued\n\n", _jobsEnqueuedCount);
 
                     await Task.Delay(delay, stoppingToken);
-                    //delay = delay.Add(TimeSpan.FromSeconds(10));
+
+                    delay = delay.TotalSeconds < maxDelay.TotalSeconds
+                        ? delay.Add(TimeSpan.FromSeconds(10))
+                        : maxDelay;
                 }
+
+                if (stoppingToken.IsCancellationRequested)
+                    eventWaitHandle.Set();
             }
             catch (Exception ex)
             {
@@ -204,13 +211,16 @@ namespace JobsQueue
 
         private async Task JobsUpdateAsFailed(Exception ex, params Job[] jobs)
         {
-
             var message = new StringBuilder(ex.ToString());
-
-            if (ex.InnerException != null)
-                message.AppendLine("|").Append(ex.InnerException);
+            var innerException = ex.InnerException;
 
             message.AppendLine("|").Append(ex.StackTrace);
+
+            while (innerException != null)
+            {
+                message.AppendLine("|").Append(innerException);
+                innerException = innerException.InnerException;
+            }
 
             foreach (var job in jobs)
             {
